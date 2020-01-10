@@ -1,12 +1,15 @@
 # -*- rpm-spec -*-
 
+# This spec file assumes you are building for Fedora 20 or newer,
+# or for RHEL 6 or newer. It may need some tweaks for other distros.
+
 %global with_gir 0
-%if 0%{?fedora} >= 12 || 0%{?rhel} >= 7
+%if 0%{?fedora} || 0%{?rhel} >= 7
 %global with_gir 1
 %endif
 
 %global with_gtk3 0
-%if 0%{?fedora} >= 15 || 0%{?rhel} >= 7
+%if 0%{?fedora} || 0%{?rhel} >= 7
 %global with_gtk3 1
 %endif
 
@@ -15,29 +18,38 @@
 %global with_vala 1
 %endif
 
-%global with_pulse 1
+%if 0%{?fedora} >= 25
+    %global tls_priority "@LIBVIRT,SYSTEM"
+%else
+    %if 0%{?fedora} >= 21
+        %global tls_priority "@SYSTEM"
+    %else
+        %global tls_priority "NORMAL"
+    %endif
+%endif
 
 Summary: A GTK2 widget for VNC clients
 Name: gtk-vnc
-Version: 0.5.2
-Release: 7%{?dist}%{?extra_release}
+Version: 0.7.0
+Release: 2%{?dist}%{?extra_release}
 License: LGPLv2+
 Group: Development/Libraries
 Source: http://ftp.gnome.org/pub/GNOME/sources/%{name}/0.5/%{name}-%{version}.tar.xz
-Patch1: 0001-Abort-if-mmap-of-coroutine-stack-fails.patch
-Patch2: 0002-Free-coroutine-stack-when-releasing-coroutine.patch
-Patch3: 0003-Only-trigger-grab-sequence-upon-release.patch
+Patch1: 0001-Restore-correct-size-of-reserved-data.patch
+Patch2: 0002-Fix-inverted-args-when-creating-framebuffer-for-test.patch
+Patch3: 0003-Avoid-sign-extension-warnings-from-coverity.patch
+Patch4: 0004-Fix-crash-when-opening-connection-from-a-GSocketAddr.patch
+Patch5: 0005-Fix-crash-when-no-error-is-set-after-connection-fail.patch
+Patch6: 0006-Report-a-proper-error-message-if-hitting-connection-.patch
+Patch7: 0007-Fix-incompatibility-with-libvncserver-websockets-han.patch
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
-URL: http://live.gnome.org/gtk-vnc
+URL: https://wiki.gnome.org/Projects/gtk-vnc
 Requires: gvnc = %{version}-%{release}
 BuildRequires: gtk2-devel >= 2.14
 BuildRequires: pygtk2-devel python-devel zlib-devel
 BuildRequires: gnutls-devel libgcrypt-devel cyrus-sasl-devel intltool
 %if %{with_gir}
 BuildRequires: gobject-introspection-devel
-%if 0%{?fedora} && 0%{?fedora} < 14
-BuildRequires: gir-repository-devel
-%endif
 %endif
 %if %{with_gtk3}
 BuildRequires: gtk3-devel
@@ -45,9 +57,7 @@ BuildRequires: gtk3-devel
 %if %{with_vala}
 BuildRequires: vala-tools
 %endif
-%if %{with_pulse}
 BuildRequires: pulseaudio-libs-devel
-%endif
 BuildRequires: /usr/bin/pod2man
 
 %description
@@ -80,6 +90,7 @@ A module allowing use of the GTK-VNC widget from python
 
 %package -n gvnc
 Summary: A GObject for VNC connections
+Group: Development/Libraries
 
 %description -n gvnc
 gvnc is a GObject for managing a VNC connection. It provides all the
@@ -99,9 +110,9 @@ with the raw protocol itself.
 
 Libraries, includes, etc. to compile with the gvnc library
 
-%if %{with_pulse}
 %package -n gvncpulse
 Summary: A Pulse Audio bridge for VNC connections
+Group: Development/Libraries
 Requires: gvnc = %{version}-%{release}
 
 %description -n gvncpulse
@@ -121,7 +132,6 @@ It allows VNC clients to play back audio on the local
 system
 
 Libraries, includes, etc. to compile with the gvnc library
-%endif
 
 %package -n gvnc-tools
 Summary: Command line VNC tools
@@ -163,6 +173,10 @@ cd gtk-vnc-%{version}
 %patch1 -p1
 %patch2 -p1
 %patch3 -p1
+%patch4 -p1
+%patch5 -p1
+%patch6 -p1
+%patch7 -p1
 cd ..
 %if %{with_gtk3}
 cp -a gtk-vnc-%{version} gtk-vnc2-%{version}
@@ -176,14 +190,16 @@ cp -a gtk-vnc-%{version} gtk-vnc2-%{version}
 %endif
 
 cd gtk-vnc-%{version}
-%configure --with-gtk=2.0 %{gir_arg}
+%configure --with-gtk=2.0 %{gir_arg} \
+	   --with-tls-priority=%{tls_priority}
 %__make %{?_smp_mflags} V=1
 chmod -x examples/*.pl examples/*.js examples/*.py
 cd ..
 
 %if %{with_gtk3}
 cd gtk-vnc2-%{version}
-%configure --with-gtk=3.0 %{gir_arg}
+%configure --with-gtk=3.0 %{gir_arg} \
+	   --with-tls-priority=%{tls_priority}
 %__make %{?_smp_mflags} V=1
 chmod -x examples/*.pl examples/*.js examples/*.py
 cd ..
@@ -223,9 +239,11 @@ rm -fr %{buildroot}
 
 %postun -n gvncpulse -p /sbin/ldconfig
 
+%if %{with_gtk3}
 %post -n gtk-vnc2 -p /sbin/ldconfig
 
 %postun -n gtk-vnc2 -p /sbin/ldconfig
+%endif
 
 %files
 %defattr(-, root, root)
@@ -247,7 +265,7 @@ rm -fr %{buildroot}
 
 %files python
 %defattr(-, root, root)
-%attr(0644, -, -) %doc gtk-vnc-%{version}/examples/gvncviewer-bindings.py
+%doc gtk-vnc-%{version}/examples/gvncviewer-bindings.py
 %{_libdir}/python*/site-packages/gtkvnc.so
 
 %files -n gvnc -f %{name}.lang
@@ -257,6 +275,7 @@ rm -fr %{buildroot}
 %{_libdir}/girepository-1.0/GVnc-1.0.typelib
 %endif
 %if %{with_vala}
+%{_datadir}/vala/vapi/gvnc-1.0.deps
 %{_datadir}/vala/vapi/gvnc-1.0.vapi
 %endif
 
@@ -270,7 +289,6 @@ rm -fr %{buildroot}
 %{_datadir}/gir-1.0/GVnc-1.0.gir
 %endif
 
-%if %{with_pulse}
 %files -n gvncpulse -f %{name}.lang
 %defattr(-, root, root)
 %{_libdir}/libgvncpulse-1.0.so.*
@@ -278,6 +296,7 @@ rm -fr %{buildroot}
 %{_libdir}/girepository-1.0/GVncPulse-1.0.typelib
 %endif
 %if %{with_vala}
+%{_datadir}/vala/vapi/gvncpulse-1.0.deps
 %{_datadir}/vala/vapi/gvncpulse-1.0.vapi
 %endif
 
@@ -289,7 +308,6 @@ rm -fr %{buildroot}
 %{_libdir}/pkgconfig/gvncpulse-1.0.pc
 %if %{with_gir}
 %{_datadir}/gir-1.0/GVncPulse-1.0.gir
-%endif
 %endif
 
 %files -n gvnc-tools
@@ -333,6 +351,23 @@ rm -fr %{buildroot}
 %endif
 
 %changelog
+* Wed Apr 12 2017 Daniel P. Berrange <berrange@redhat.com> - 0.7.0-2
+- Fix reserved data size (rhbz #1416783)
+- Fix inverted args in tests (rhbz #1416783)	  
+- Avoid sign extension problems (rhbz #1416783)
+- Fix crash with opening via GSocketAddress (rhbz #1416783)
+- Fix crash & error reporting during connection timeout (rhbz #1441120)
+- Fix incompatibility with libvncserver websockets (rhbz #921330)
+
+* Thu Feb 16 2017 Daniel P. Berrange <berrange@redhat.com> - 0.7.0-1
+- Update to 0.7.0 release (rhbz #1416783)
+- Release held keys when loosing focus (rhbz #921008)
+- Avoid warnings when disconnecting (rhbz #1126825)
+- Workaround to avoid hang connecting to SPICE guest (rhbz #921330)
+- CVE-2017-5884 - fix bounds checking for RRE, hextile and
+  copyrect encodings (rhbz #1425367)
+- CVE-2017-5885 - fix color map index bounds checking (rhbz #1425367)
+
 * Fri Jan 24 2014 Daniel Mach <dmach@redhat.com> - 0.5.2-7
 - Mass rebuild 2014-01-24
 

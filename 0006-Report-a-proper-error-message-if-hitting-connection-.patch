@@ -1,0 +1,32 @@
+From 3691a5e5fdf7aeab78ad9b038994c1d24063a509 Mon Sep 17 00:00:00 2001
+From: "Daniel P. Berrange" <berrange@redhat.com>
+Date: Tue, 11 Apr 2017 11:06:28 +0100
+Subject: [PATCH] Report a proper error message if hitting connection timeout
+
+Signed-off-by: Daniel P. Berrange <berrange@redhat.com>
+(cherry picked from commit 283434730d0cc3a1ee8270e137d71cebe4f0e01b)
+---
+ src/vncconnection.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/vncconnection.c b/src/vncconnection.c
+index e5b43a0..2b2bdbb 100644
+--- a/src/vncconnection.c
++++ b/src/vncconnection.c
+@@ -103,6 +103,8 @@
+ #endif
+ 
+ 
++#define GTK_VNC_ERROR g_quark_from_static_string("gtk-vnc")
++
+ struct wait_queue
+ {
+     gboolean waiting;
+@@ -5386,6 +5388,7 @@ static GSocket *vnc_connection_connect_socket(struct wait_queue *wait,
+             *error = NULL;
+             VNC_DEBUG("Socket pending");
+             if (!g_io_wait_interruptable(wait, sock, G_IO_OUT|G_IO_ERR|G_IO_HUP)) {
++                g_set_error(error, GTK_VNC_ERROR, 0, "%s", "Connection timed out");
+                 VNC_DEBUG("connect interrupted");
+                 timeout = 0;
+                 goto timeout;

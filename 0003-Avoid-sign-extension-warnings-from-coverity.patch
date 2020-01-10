@@ -1,0 +1,34 @@
+From b608ab801c6dfd5babd224d5f8a21010ccb64b28 Mon Sep 17 00:00:00 2001
+From: "Daniel P. Berrange" <berrange@redhat.com>
+Date: Thu, 6 Apr 2017 17:21:29 +0100
+Subject: [PATCH] Avoid sign extension warnings from coverity
+
+ src/vncconnection.c:3082: sign_extension:
+ Suspicious implicit sign extension: "height" with type "unsigned short"
+ (16 bits, unsigned) is promoted in "rowlen * height" to type "int"
+ (32 bits, signed), then sign-extended to type "unsigned long"
+ (64 bits, unsigned). If "rowlen * height" is greater than 0x7FFFFFFF,
+ the upper bits of the result will all be 1.
+
+The 'rowlen' variable is initialization from the unsigned width
+variable, so should have used uint instead of int.
+
+Signed-off-by: Daniel P. Berrange <berrange@redhat.com>
+(cherry picked from commit c3e5d23d67c9a209f127caab7843d94a91031a5f)
+---
+ src/vncconnection.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/vncconnection.c b/src/vncconnection.c
+index 19dbfee..c55f71d 100644
+--- a/src/vncconnection.c
++++ b/src/vncconnection.c
+@@ -3064,7 +3064,7 @@ static void vnc_connection_xcursor(VncConnection *conn, guint16 x, guint16 y, gu
+         guint8 *pixbuf = NULL;
+         guint8 *data, *mask, *datap, *maskp;
+         guint32 *pixp;
+-        int rowlen;
++        guint rowlen;
+         int x1, y1;
+         guint8 fgrgb[3], bgrgb[3];
+         guint32 fg, bg;

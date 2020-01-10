@@ -40,6 +40,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef G_OS_WIN32
+#include <windows.h>
+#include <gdk/gdkwin32.h>
+#ifndef MAPVK_VK_TO_VSC /* may be undefined in older mingw-headers */
+#define MAPVK_VK_TO_VSC 0
+#endif
+#endif
+
 #define VNC_DISPLAY_GET_PRIVATE(obj)                                    \
     (G_TYPE_INSTANCE_GET_PRIVATE((obj), VNC_TYPE_DISPLAY, VncDisplayPrivate))
 
@@ -74,14 +82,20 @@ struct _VncDisplayPrivate
     gboolean allow_scaling;
     gboolean shared_flag;
     gboolean force_size;
+    gboolean smoothing;
 
     GSList *preferable_auths;
     GSList *preferable_vencrypt_subauths;
     size_t keycode_maplen;
     const guint16 *keycode_map;
 
+    gboolean vncgrabpending; /* Key sequence detected, waiting for release */
     VncGrabSequence *vncgrabseq; /* the configured key sequence */
     gboolean *vncactiveseq; /* the currently pressed keys */
+
+#ifdef WIN32
+    HHOOK keyboard_hook;
+#endif
 };
 
 G_DEFINE_TYPE(VncDisplay, vnc_display, GTK_TYPE_DRAWING_AREA)
@@ -101,6 +115,7 @@ enum
     PROP_SCALING,
     PROP_SHARED_FLAG,
     PROP_FORCE_SIZE,
+    PROP_SMOOTHING,
     PROP_DEPTH,
     PROP_GRAB_KEYS,
     PROP_CONNECTION,
@@ -126,6 +141,7 @@ typedef enum
 
         VNC_SERVER_CUT_TEXT,
         VNC_BELL,
+        VNC_ERROR,
 
         LAST_SIGNAL
     } vnc_display_signals;
@@ -211,6 +227,9 @@ vnc_display_get_property (GObject    *object,
         case PROP_FORCE_SIZE:
             g_value_set_boolean (value, vnc->priv->force_size);
             break;
+        case PROP_SMOOTHING:
+            g_value_set_boolean (value, vnc->priv->smoothing);
+            break;
         case PROP_DEPTH:
             g_value_set_enum (value, vnc->priv->depth);
             break;
@@ -260,6 +279,9 @@ vnc_display_set_property (GObject      *object,
         case PROP_FORCE_SIZE:
             vnc_display_set_force_size (vnc, g_value_get_boolean (value));
             break;
+        case PROP_SMOOTHING:
+            vnc_display_set_smoothing (vnc, g_value_get_boolean (value));
+            break;
         case PROP_DEPTH:
             vnc_display_set_depth (vnc, g_value_get_enum (value));
             break;
@@ -272,6 +294,17 @@ vnc_display_set_property (GObject      *object,
         }
 }
 
+
+/**
+ * vnc_display_new:
+ *
+ * Create a new widget capable of connecting to a VNC server
+ * and displaying its contents
+ *
+ * The widget will initially be in a disconnected state
+ *
+ * Returns: (transfer full): the new VNC display widget
+ */
 GtkWidget *vnc_display_new(void)
 {
     return GTK_WIDGET(g_object_new(VNC_TYPE_DISPLAY, NULL));
@@ -284,6 +317,44 @@ static GdkCursor *create_null_cursor(void)
     return cursor;
 }
 
+#ifdef G_OS_WIN32
+static HWND win32_window = NULL;
+
+static LRESULT CALLBACK keyboard_hook_cb(int code, WPARAM wparam, LPARAM lparam)
+{
+    if  (win32_window && code == HC_ACTION && wparam != WM_KEYUP) {
+        KBDLLHOOKSTRUCT *hooked = (KBDLLHOOKSTRUCT*)lparam;
+        DWORD dwmsg = (hooked->flags << 24) | (hooked->scanCode << 16) | 1;
+
+        if (hooked->vkCode == VK_NUMLOCK || hooked->vkCode == VK_RSHIFT) {
+            dwmsg &= ~(1 << 24);
+            SendMessage(win32_window, wparam, hooked->vkCode, dwmsg);
+        }
+        switch (hooked->vkCode) {
+        case VK_CAPITAL:
+        case VK_SCROLL:
+        case VK_NUMLOCK:
+        case VK_LSHIFT:
+        case VK_RSHIFT:
+        case VK_RCONTROL:
+        case VK_LMENU:
+        case VK_RMENU:
+            break;
+        case VK_LCONTROL:
+            /* When pressing AltGr, an extra VK_LCONTROL with a special
+             * scancode with bit 9 set is sent. Let's ignore the extra
+             * VK_LCONTROL, as that will make AltGr misbehave. */
+            if (hooked->scanCode & 0x200)
+                return 1;
+            break;
+        default:
+            SendMessage(win32_window, wparam, hooked->vkCode, dwmsg);
+            return 1;
+        }
+    }
+    return CallNextHookEx(NULL, code, wparam, lparam);
+}
+#endif
 
 static void setup_surface_cache(VncDisplay *dpy, cairo_t *crWin, int w, int h)
 {
@@ -360,6 +431,10 @@ static gboolean draw_event(GtkWidget *widget, cairo_t *cr)
                                      priv->fbCache,
                                      0,
                                      0);
+            if (!priv->smoothing) {
+                cairo_pattern_set_filter(cairo_get_source(cr),
+                                         CAIRO_FILTER_NEAREST);
+            }
         } else {
             cairo_set_source_surface(cr,
                                      priv->fbCache,
@@ -399,6 +474,9 @@ static gboolean expose_event(GtkWidget *widget, GdkEventExpose *expose)
 #if !GTK_CHECK_VERSION(3, 0, 0)
 static void do_keyboard_grab_all(GdkWindow *window)
 {
+    if (window == NULL)
+        return;
+
     gdk_keyboard_grab(window,
                       FALSE,
                       GDK_CURRENT_TIME);
@@ -410,6 +488,9 @@ static void do_keyboard_ungrab_all(GdkWindow *window G_GNUC_UNUSED)
 static void do_pointer_grab_all(GdkWindow *window,
                                 GdkCursor *cursor)
 {
+    if (window == NULL)
+        return;
+
     gdk_pointer_grab(window,
                      FALSE, /* All events to come to our window directly */
                      GDK_POINTER_MOTION_MASK |
@@ -506,7 +587,15 @@ static void do_keyboard_grab(VncDisplay *obj, gboolean quiet)
 {
     VncDisplayPrivate *priv = obj->priv;
 
+#ifdef G_OS_WIN32
+    if (priv->keyboard_hook == NULL)
+        priv->keyboard_hook = SetWindowsHookEx(WH_KEYBOARD_LL, keyboard_hook_cb,
+                                               GetModuleHandle(NULL), 0);
+    g_warn_if_fail(priv->keyboard_hook != NULL);
+#endif
+
     do_keyboard_grab_all(gtk_widget_get_window(GTK_WIDGET(obj)));
+
     priv->in_keyboard_grab = TRUE;
     if (!quiet)
         g_signal_emit(obj, signals[VNC_KEYBOARD_GRAB], 0);
@@ -518,6 +607,14 @@ static void do_keyboard_ungrab(VncDisplay *obj, gboolean quiet)
     VncDisplayPrivate *priv = obj->priv;
 
     do_keyboard_ungrab_all(gtk_widget_get_window(GTK_WIDGET(obj)));
+
+#ifdef G_OS_WIN32
+    if (priv->keyboard_hook != NULL) {
+        UnhookWindowsHookEx(priv->keyboard_hook);
+        priv->keyboard_hook = NULL;
+    }
+#endif
+
     priv->in_keyboard_grab = FALSE;
     if (!quiet)
         g_signal_emit(obj, signals[VNC_KEYBOARD_UNGRAB], 0);
@@ -526,15 +623,24 @@ static void do_keyboard_ungrab(VncDisplay *obj, gboolean quiet)
 static void do_pointer_hide(VncDisplay *obj)
 {
     VncDisplayPrivate *priv = obj->priv;
-    gdk_window_set_cursor(gtk_widget_get_window(GTK_WIDGET(obj)),
+    GdkWindow *window = gtk_widget_get_window(GTK_WIDGET(obj));
+
+    if (window == NULL)
+        return;
+
+    gdk_window_set_cursor(window,
                           priv->remote_cursor ? priv->remote_cursor : priv->null_cursor);
 }
 
 static void do_pointer_show(VncDisplay *obj)
 {
     VncDisplayPrivate *priv = obj->priv;
-    gdk_window_set_cursor(gtk_widget_get_window(GTK_WIDGET(obj)),
-                          priv->remote_cursor);
+    GdkWindow *window = gtk_widget_get_window(GTK_WIDGET(obj));
+
+    if (window == NULL)
+        return;
+
+    gdk_window_set_cursor(window, priv->remote_cursor);
 }
 
 static void do_pointer_grab(VncDisplay *obj, gboolean quiet)
@@ -578,6 +684,16 @@ static void do_pointer_ungrab(VncDisplay *obj, gboolean quiet)
         g_signal_emit(obj, signals[VNC_POINTER_UNGRAB], 0);
 }
 
+/**
+ * vnc_display_force_grab:
+ * @obj: (transfer none): the VNC display widget
+ * @enable: TRUE to force pointer grabbing, FALSE otherwise
+ *
+ * If @enable is TRUE, immediately grab the pointer.
+ * If @enable is FALSE, immediately ungrab the pointer.
+ * This overrides any automatic grabs that may have
+ * been done.
+ */
 void vnc_display_force_grab(VncDisplay *obj, gboolean enable)
 {
     if (enable)
@@ -763,11 +879,19 @@ static gboolean motion_event(GtkWidget *widget, GdkEventMotion *motion)
             dx = (int)motion->x;
             dy = (int)motion->y;
 
-            /* Drop out of bounds motion to avoid upsetting
-             * the server */
-            if (dx < 0 || dx >= fbw ||
-                dy < 0 || dy >= fbh)
-                return FALSE;
+            /* If the co-ords are out of bounds we want to clamp
+             * them to the boundaries. We don't want to actually
+             * drop the events though, because even if the X coord
+             * is out of bounds we want the server to see Y coord
+             * changes, and vica-verca. */
+            if (dx < 0)
+                dx = 0;
+            if (dy < 0)
+                dy = 0;
+            if (dx >= fbw)
+                dx = fbw - 1;
+            if (dy >= fbh)
+                dy = fbh - 1;
         } else {
             /* Just send the delta since last motion event */
             dx = (int)motion->x + 0x7FFF - priv->last_x;
@@ -784,6 +908,17 @@ static gboolean motion_event(GtkWidget *widget, GdkEventMotion *motion)
 }
 
 
+/*
+ * Lets say the grab sequence of Ctrl_L + Alt_L
+ *
+ * We first need to detect when both Ctrl_L and Alt_L are pressed.
+ * When this happens we are "primed" to tigger.
+ *
+ * If any further key is pressed though, we unprime ourselves
+ *
+ * If any key is released while we are primed, then we
+ * trigger.
+ */
 static gboolean check_for_grab_key(GtkWidget *widget, int type, int keyval)
 {
     VncDisplayPrivate *priv = VNC_DISPLAY(widget)->priv;
@@ -793,23 +928,42 @@ static gboolean check_for_grab_key(GtkWidget *widget, int type, int keyval)
         return FALSE;
 
     if (type == GDK_KEY_RELEASE) {
+        gboolean active = priv->vncgrabpending;
         /* Any key release resets the whole grab sequence */
         memset(priv->vncactiveseq, 0,
                sizeof(gboolean)*priv->vncgrabseq->nkeysyms);
+        priv->vncgrabpending = FALSE;
+        return active;
+    } else {
+        gboolean setone = FALSE;
+
+        /* Record the new key press */
+        for (i = 0 ; i < priv->vncgrabseq->nkeysyms ; i++) {
+            if (priv->vncgrabseq->keysyms[i] == keyval) {
+                priv->vncactiveseq[i] = TRUE;
+                setone = TRUE;
+            }
+        }
+
+        if (setone) {
+            /* Return if any key is not pressed */
+            for (i = 0 ; i < priv->vncgrabseq->nkeysyms ; i++)
+                if (priv->vncactiveseq[i] == FALSE)
+                    return FALSE;
+
+            /* All keys in grab seq are pressed, so prime
+             * to trigger on release
+             */
+            priv->vncgrabpending = TRUE;
+        } else {
+            /* Key not in grab seq, so must reset any pending
+             * grab keys we have */
+            memset(priv->vncactiveseq, 0,
+                   sizeof(gboolean)*priv->vncgrabseq->nkeysyms);
+            priv->vncgrabpending = FALSE;
+        }
 
         return FALSE;
-    } else {
-        /* Record the new key press */
-        for (i = 0 ; i < priv->vncgrabseq->nkeysyms ; i++)
-            if (priv->vncgrabseq->keysyms[i] == keyval)
-                priv->vncactiveseq[i] = TRUE;
-
-        /* Return if any key is not pressed */
-        for (i = 0 ; i < priv->vncgrabseq->nkeysyms ; i++)
-            if (priv->vncactiveseq[i] == FALSE)
-                return FALSE;
-
-        return TRUE;
     }
 }
 
@@ -826,9 +980,22 @@ static gboolean key_event(GtkWidget *widget, GdkEventKey *key)
     if (priv->read_only)
         return FALSE;
 
-    VNC_DEBUG("%s keycode: %d  state: %d  group %d, keyval: %d",
+    VNC_DEBUG("%s keycode: %d  state: %u  group %d, keyval: %d",
               key->type == GDK_KEY_PRESS ? "press" : "release",
               key->hardware_keycode, key->state, key->group, keyval);
+
+#ifdef G_OS_WIN32
+    /* on windows, we ought to ignore the reserved key event? */
+    if (key->hardware_keycode == 0xff)
+        return FALSE;
+
+    if (!priv->in_keyboard_grab) {
+        if (key->hardware_keycode == VK_LWIN ||
+            key->hardware_keycode == VK_RWIN ||
+            key->hardware_keycode == VK_APPS)
+            return FALSE;
+    }
+#endif
 
     keyval = vnc_display_keyval_from_keycode(key->hardware_keycode, keyval);
 
@@ -863,6 +1030,11 @@ static gboolean key_event(GtkWidget *widget, GdkEventKey *key)
             guint16 scancode = vnc_display_keymap_gdk2rfb(priv->keycode_map,
                                                           priv->keycode_maplen,
                                                           key->hardware_keycode);
+#ifdef G_OS_WIN32
+            /* MapVirtualKey doesn't return scancode with needed higher byte */
+            scancode = MapVirtualKey(key->hardware_keycode, MAPVK_VK_TO_VSC) |
+                (scancode & 0xff00);
+#endif
             /*
              * ..send the key release event we're dealing with
              *
@@ -886,6 +1058,11 @@ static gboolean key_event(GtkWidget *widget, GdkEventKey *key)
                 guint16 scancode = vnc_display_keymap_gdk2rfb(priv->keycode_map,
                                                               priv->keycode_maplen,
                                                               key->hardware_keycode);
+#ifdef G_OS_WIN32
+                /* MapVirtualKey doesn't return scancode with needed higher byte */
+                scancode = MapVirtualKey(key->hardware_keycode, MAPVK_VK_TO_VSC) |
+                    (scancode & 0xff00);
+#endif
                 priv->down_keyval[i] = keyval;
                 priv->down_scancode[i] = key->hardware_keycode;
                 /* Send the actual key event we're dealing with */
@@ -918,6 +1095,10 @@ static gboolean enter_event(GtkWidget *widget, GdkEventCrossing *crossing G_GNUC
     if (priv->local_pointer)
         do_pointer_show(VNC_DISPLAY(widget));
 
+#ifdef G_OS_WIN32
+    win32_window = gdk_win32_window_get_impl_hwnd(gtk_widget_get_window(widget));
+#endif
+
     return TRUE;
 }
 
@@ -931,20 +1112,19 @@ static gboolean leave_event(GtkWidget *widget, GdkEventCrossing *crossing G_GNUC
     if (priv->grab_keyboard)
         do_keyboard_ungrab(VNC_DISPLAY(widget), FALSE);
 
-    if (priv->grab_pointer)
+    if (priv->local_pointer)
+        do_pointer_hide(VNC_DISPLAY(widget));
+
+    if (priv->grab_pointer && !priv->absolute)
         do_pointer_ungrab(VNC_DISPLAY(widget), FALSE);
 
     return TRUE;
 }
 
-
-static gboolean focus_event(GtkWidget *widget, GdkEventFocus *focus G_GNUC_UNUSED)
+static void release_keys(VncDisplay *display)
 {
-    VncDisplayPrivate *priv = VNC_DISPLAY(widget)->priv;
+    VncDisplayPrivate *priv = display->priv;
     int i;
-
-    if (priv->conn == NULL || !vnc_connection_is_initialized(priv->conn))
-        return FALSE;
 
     for (i = 0 ; i < (int)(sizeof(priv->down_keyval)/sizeof(priv->down_keyval[0])) ; i++) {
         /* We are currently pressed so... */
@@ -959,9 +1139,60 @@ static gboolean focus_event(GtkWidget *widget, GdkEventFocus *focus G_GNUC_UNUSE
             priv->down_scancode[i] = 0;
         }
     }
+}
+
+static gboolean focus_in_event(GtkWidget *widget, GdkEventFocus *focus G_GNUC_UNUSED)
+{
+    VncDisplayPrivate *priv = VNC_DISPLAY(widget)->priv;
+
+    if (priv->conn == NULL || !vnc_connection_is_initialized(priv->conn))
+        return FALSE;
+
+    if (!gtk_widget_get_realized(widget))
+        return TRUE;
+
+#ifdef G_OS_WIN32
+    win32_window = gdk_win32_window_get_impl_hwnd(gtk_widget_get_window(widget));
+#endif
 
     return TRUE;
 }
+
+
+static gboolean focus_out_event(GtkWidget *widget, GdkEventFocus *focus G_GNUC_UNUSED)
+{
+    VncDisplayPrivate *priv = VNC_DISPLAY(widget)->priv;
+
+    if (priv->conn == NULL || !vnc_connection_is_initialized(priv->conn))
+        return FALSE;
+
+    release_keys(VNC_DISPLAY(widget));
+#ifdef G_OS_WIN32
+    win32_window = NULL;
+#endif
+
+    return TRUE;
+}
+
+
+static void grab_notify(GtkWidget *widget, gboolean was_grabbed)
+{
+    if (was_grabbed == FALSE)
+        release_keys(VNC_DISPLAY(widget));
+}
+
+
+static void realize_event(GtkWidget *widget)
+{
+    VncDisplay *obj = VNC_DISPLAY(widget);
+    VncDisplayPrivate *priv = obj->priv;
+
+    GTK_WIDGET_CLASS (vnc_display_parent_class)->realize (widget);
+
+    gdk_window_set_cursor(gtk_widget_get_window(GTK_WIDGET(obj)),
+                          priv->remote_cursor ? priv->remote_cursor : priv->null_cursor);
+}
+
 
 static void on_framebuffer_update(VncConnection *conn G_GNUC_UNUSED,
                                   int x, int y, int w, int h,
@@ -1124,15 +1355,12 @@ static gboolean vnc_display_set_preferred_pixel_format(VncDisplay *display)
         VNC_DEBUG ("Using default colour depth %d (%d bpp) (true color? %d)",
                    currentFormat->depth, currentFormat->bits_per_pixel,
                    currentFormat->true_color_flag);
-#if 0
         /* TigerVNC always sends back the encoding even if
-           unchanged from what the server suggested. This
-           does not appear to matter, so lets save the bytes */
+           unchanged from what the server suggested. This is
+           important with some VNC servers, since they won't
+           otherwise send us the colour map entries */
         memcpy(&fmt, currentFormat, sizeof(fmt));
         break;
-#else
-        return TRUE;
-#endif
 
     case VNC_DISPLAY_DEPTH_COLOR_FULL:
         fmt.depth = 24;
@@ -1187,9 +1415,9 @@ static gboolean vnc_display_set_preferred_pixel_format(VncDisplay *display)
     }
 
 #if GTK_CHECK_VERSION (2, 21, 1)
-    fmt.byte_order = gdk_visual_get_byte_order (v) == GDK_LSB_FIRST ? G_BIG_ENDIAN : G_LITTLE_ENDIAN;
+    fmt.byte_order = gdk_visual_get_byte_order (v) == GDK_LSB_FIRST ? G_LITTLE_ENDIAN : G_BIG_ENDIAN;
 #else
-    fmt.byte_order = v->byte_order == GDK_LSB_FIRST ? G_BIG_ENDIAN : G_LITTLE_ENDIAN;
+    fmt.byte_order = v->byte_order == GDK_LSB_FIRST ? G_LITTLE_ENDIAN : G_BIG_ENDIAN;
 #endif
 
     VNC_DEBUG ("Set depth color to %d (%d bpp)", fmt.depth, fmt.bits_per_pixel);
@@ -1293,7 +1521,7 @@ static void on_auth_choose_subtype(VncConnection *conn,
     } else if (type == VNC_CONNECTION_AUTH_VENCRYPT) {
         l = priv->preferable_vencrypt_subauths;
     } else {
-        VNC_DEBUG("Unexpected stackable auth type %d", type);
+        VNC_DEBUG("Unexpected stackable auth type %u", type);
         vnc_connection_shutdown(conn);
         return;
     }
@@ -1433,6 +1661,17 @@ static void on_connected(VncConnection *conn G_GNUC_UNUSED,
 }
 
 
+static void on_error(VncConnection *conn G_GNUC_UNUSED,
+                     const char *message,
+                     gpointer opaque)
+{
+    VncDisplay *obj = VNC_DISPLAY(opaque);
+
+    g_signal_emit(G_OBJECT(obj), signals[VNC_ERROR], 0, message);
+    VNC_DEBUG("VNC server error");
+}
+
+
 static void on_initialized(VncConnection *conn G_GNUC_UNUSED,
                            gpointer opaque)
 {
@@ -1523,10 +1762,27 @@ static void on_disconnected(VncConnection *conn G_GNUC_UNUSED,
 }
 
 
+/**
+ * vnc_display_open_fd:
+ * @obj: (transfer none): the VNC display widget
+ * @fd: file descriptor to use for the connection
+ *
+ * Open a connection using @fd as the transport. If @fd
+ * refers to a TCP connection, it is recommended to use
+ * vnc_display_open_fd_with_hostname instead, to
+ * provide the remote hostname. This allows use of
+ * x509 based authentication which requires a hostname
+ * to be available.
+ *
+ * Returns: TRUE if a connection was opened, FALSE if already open
+ */
 gboolean vnc_display_open_fd(VncDisplay *obj, int fd)
 {
-    VncDisplayPrivate *priv = obj->priv;
+    VncDisplayPrivate *priv;
 
+    g_return_val_if_fail(VNC_IS_DISPLAY(obj), FALSE);
+
+    priv = obj->priv;
     if (vnc_connection_is_open(priv->conn))
         return FALSE;
 
@@ -1542,10 +1798,27 @@ gboolean vnc_display_open_fd(VncDisplay *obj, int fd)
 }
 
 
+/**
+ * vnc_display_open_fd_with_hostname:
+ * @obj: (transfer none): the VNC display widget
+ * @fd: file descriptor to use for the connection
+ * @hostname: (transfer none)(nullable): the host associated with the connection
+ *
+ * Open a connection using @fd as the transport. The
+ * @hostname provided should reflect the name of the
+ * host that the @fd provides a connection to. This
+ * will be used by some authentication schemes, for
+ * example x509 certificate validation against @hostname.
+ *
+ * Returns: TRUE if a connection was opened, FALSE if already open
+ */
 gboolean vnc_display_open_fd_with_hostname(VncDisplay *obj, int fd, const char *hostname)
 {
-    VncDisplayPrivate *priv = obj->priv;
+    VncDisplayPrivate *priv;
 
+    g_return_val_if_fail(VNC_IS_DISPLAY(obj), FALSE);
+
+    priv = obj->priv;
     if (vnc_connection_is_open(priv->conn))
         return FALSE;
 
@@ -1561,10 +1834,33 @@ gboolean vnc_display_open_fd_with_hostname(VncDisplay *obj, int fd, const char *
 }
 
 
+/**
+ * vnc_display_open_addr:
+ * @obj: (transfer none): the VNC display widget
+ * @addr: (transfer none): the socket address
+ * @hostname: (transfer none)(nullable): the hostname
+ *
+ * Open a socket connection to server identified by @addr.
+ * @addr may refer to either a TCP address (IPv4/6) or
+ * a UNIX socket address. The @hostname provided should
+ * reflect the name of the host that the @addr provides a
+ * connection to, if it is not already available in @addr.
+ * For example, if @addr points to a proxy server, then
+ * @hostname can be used to provide the name of the final
+ * endpoint. This will be used by some authentication
+ * schemes, for example x509 certificate validation
+ * against @hostname.
+ *
+ * Returns: TRUE if a connection was opened, FALSE if already open
+ */
 gboolean vnc_display_open_addr(VncDisplay *obj, GSocketAddress *addr, const char *hostname)
 {
-    VncDisplayPrivate *priv = obj->priv;
+    VncDisplayPrivate *priv;
 
+    g_return_val_if_fail(VNC_IS_DISPLAY(obj), FALSE);
+    g_return_val_if_fail(addr != NULL, FALSE);
+
+    priv = obj->priv;
     if (vnc_connection_is_open(priv->conn))
         return FALSE;
 
@@ -1580,10 +1876,26 @@ gboolean vnc_display_open_addr(VncDisplay *obj, GSocketAddress *addr, const char
 }
 
 
+/**
+ * vnc_display_open_host:
+ * @obj: (transfer none): the VNC display widget
+ * @host: (transfer none): the host name or IP address
+ * @port: (transfer none): the service name or port number
+ *
+ * Open a TCP connection to the remote desktop at @host
+ * listening on @port.
+ *
+ * Returns: TRUE if a connection was opened, FALSE if already open
+ */
 gboolean vnc_display_open_host(VncDisplay *obj, const char *host, const char *port)
 {
-    VncDisplayPrivate *priv = obj->priv;
+    VncDisplayPrivate *priv;
 
+    g_return_val_if_fail(VNC_IS_DISPLAY(obj), FALSE);
+    g_return_val_if_fail(host != NULL, FALSE);
+    g_return_val_if_fail(port != NULL, FALSE);
+
+    priv = obj->priv;
     if (vnc_connection_is_open(priv->conn))
         return FALSE;
 
@@ -1598,18 +1910,40 @@ gboolean vnc_display_open_host(VncDisplay *obj, const char *host, const char *po
     return TRUE;
 }
 
+
+/**
+ * vnc_display_is_open:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Check if the connection for the display is currently open
+ *
+ * Returns: TRUE if open, FALSE if closing/closed
+ */
 gboolean vnc_display_is_open(VncDisplay *obj)
 {
-    VncDisplayPrivate *priv = obj->priv;
+    g_return_val_if_fail(VNC_IS_DISPLAY(obj), FALSE);
 
-    return vnc_connection_is_open(priv->conn);
+    return vnc_connection_is_open(obj->priv->conn);
 }
 
+
+/**
+ * vnc_display_close:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Request that the connection to the remote display
+ * is closed. The actual close will complete asynchronously
+ * and the "vnc-disconnected" signal will be emitted once
+ * complete.
+ */
 void vnc_display_close(VncDisplay *obj)
 {
-    VncDisplayPrivate *priv = obj->priv;
+    VncDisplayPrivate *priv;
     GtkWidget *widget = GTK_WIDGET(obj);
 
+    g_return_if_fail(VNC_IS_DISPLAY(obj));
+
+    priv = obj->priv;
     if (vnc_connection_is_open(priv->conn)) {
         VNC_DEBUG("Requesting graceful shutdown of connection");
         vnc_connection_shutdown(priv->conn);
@@ -1624,25 +1958,39 @@ void vnc_display_close(VncDisplay *obj)
 }
 
 
+/**
+ * vnc_display_get_connection:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Get the VNC connection object associated with the
+ * display
+ *
+ * Returns: (transfer none): the connection object
+ */
 VncConnection * vnc_display_get_connection(VncDisplay *obj)
 {
-    VncDisplayPrivate *priv = obj->priv;
-    return priv->conn;
+    g_return_val_if_fail(VNC_IS_DISPLAY(obj), NULL);
+
+    return obj->priv->conn;
 }
 
 
 /**
  * vnc_display_send_keys:
- *
- * @obj: The #VncDisplay
+ * @obj: (transfer none): the VNC display widget
  * @keyvals: (array length=nkeyvals): Keyval array
  * @nkeyvals: Length of keyvals
  *
- * Send keyval click events to the display.
+ * Send keyval click events to the display. Al the
+ * key press events will be sent first and then all
+ * the key release events.
  *
+ * @keyvals should contain the X11 key value constants
  */
 void vnc_display_send_keys(VncDisplay *obj, const guint *keyvals, int nkeyvals)
 {
+    g_return_if_fail(VNC_IS_DISPLAY(obj));
+
     vnc_display_send_keys_ex(obj, keyvals,
                              nkeyvals, VNC_DISPLAY_KEY_EVENT_CLICK);
 }
@@ -1664,10 +2012,29 @@ static guint get_scancode_from_keyval(VncDisplay *obj, guint keyval)
     return vnc_display_keymap_gdk2rfb(priv->keycode_map, priv->keycode_maplen, keycode);
 }
 
+
+/**
+ * vnc_display_send_keys_ex:
+ * @obj: (transfer none): the VNC display widget
+ * @keyvals: (array length=nkeyvals): Keyval array
+ * @nkeyvals: Length of keyvals
+ * @kind: the type of event to send
+ *
+ * Sends key events to the remote server. @keyvals
+ * should contain X11 key code values. These will
+ * be automatically converted to XT scancodes if
+ * needed
+ *
+ * If @kind is VNC_DISPLAY_KEY_EVENT_CLICK then all
+ * the key press events will be sent first, followed
+ * by all the key release events.
+ */
 void vnc_display_send_keys_ex(VncDisplay *obj, const guint *keyvals,
                               int nkeyvals, VncDisplayKeyEvent kind)
 {
     int i;
+
+    g_return_if_fail(VNC_IS_DISPLAY(obj));
 
     if (obj->priv->conn == NULL || !vnc_connection_is_open(obj->priv->conn) || obj->priv->read_only)
         return;
@@ -1685,9 +2052,24 @@ void vnc_display_send_keys_ex(VncDisplay *obj, const guint *keyvals,
     }
 }
 
+
+/**
+ * vnc_display_send_pointer:
+ * @obj: (transfer none): the VNC display widget
+ * @x: the desired horizontal position
+ * @y: the desired vertical position
+ * @button_mask: the state of the buttons
+ *
+ * Move the remote pointer to position (@x, @y) and set the
+ * button state to @button_mask.  This method will only
+ * work if the desktop is using absolute pointer mode. It
+ * will be a no-op if in relative pointer mode.
+ */
 void vnc_display_send_pointer(VncDisplay *obj, gint x, gint y, int button_mask)
 {
     VncDisplayPrivate *priv = obj->priv;
+
+    g_return_if_fail(VNC_IS_DISPLAY(obj));
 
     if (priv->conn == NULL || !vnc_connection_is_open(obj->priv->conn))
         return;
@@ -1745,6 +2127,11 @@ static void vnc_display_finalize (GObject *obj)
         priv->vncgrabseq = NULL;
     }
 
+    if (priv->vncactiveseq) {
+        g_free(priv->vncactiveseq);
+        priv->vncactiveseq = NULL;
+    }
+
     g_slist_free (priv->preferable_auths);
     g_slist_free (priv->preferable_vencrypt_subauths);
 
@@ -1772,7 +2159,10 @@ static void vnc_display_class_init(VncDisplayClass *klass)
     gtkwidget_class->key_release_event = key_event;
     gtkwidget_class->enter_notify_event = enter_event;
     gtkwidget_class->leave_notify_event = leave_event;
-    gtkwidget_class->focus_out_event = focus_event;
+    gtkwidget_class->focus_in_event = focus_in_event;
+    gtkwidget_class->focus_out_event = focus_out_event;
+    gtkwidget_class->grab_notify = grab_notify;
+    gtkwidget_class->realize = realize_event;
 
     object_class->finalize = vnc_display_finalize;
     object_class->get_property = vnc_display_get_property;
@@ -1904,6 +2294,18 @@ static void vnc_display_class_init(VncDisplayClass *klass)
                                                             G_PARAM_STATIC_BLURB));
 
     g_object_class_install_property (object_class,
+                                     PROP_SMOOTHING,
+                                     g_param_spec_boolean ( "smoothing",
+                                                            "Smooth scaling",
+                                                            "Whether we should smoothly interpolate when scaling",
+                                                            TRUE,
+                                                            G_PARAM_READWRITE |
+                                                            G_PARAM_CONSTRUCT |
+                                                            G_PARAM_STATIC_NAME |
+                                                            G_PARAM_STATIC_NICK |
+                                                            G_PARAM_STATIC_BLURB));
+
+    g_object_class_install_property (object_class,
                                      PROP_DEPTH,
                                      g_param_spec_enum    ( "depth",
                                                             "Depth",
@@ -1966,6 +2368,17 @@ static void vnc_display_class_init(VncDisplayClass *klass)
                       g_cclosure_marshal_VOID__VOID,
                       G_TYPE_NONE,
                       0);
+
+    signals[VNC_ERROR] =
+        g_signal_new ("vnc-error",
+                      G_OBJECT_CLASS_TYPE (object_class),
+                      G_SIGNAL_RUN_FIRST,
+                      0,
+                      NULL, NULL,
+                      g_cclosure_marshal_VOID__STRING,
+                      G_TYPE_NONE,
+                      1,
+                      G_TYPE_STRING);
 
     signals[VNC_AUTH_CREDENTIAL] =
         g_signal_new ("vnc-auth-credential",
@@ -2104,7 +2517,19 @@ static void vnc_display_init(VncDisplay *display)
                           GDK_LEAVE_NOTIFY_MASK |
                           GDK_SCROLL_MASK |
                           GDK_KEY_PRESS_MASK);
+    /* We already have off-screen buffers we render to
+     * but with GTK-3 there are problems with overlaid
+     * windows. We end up rendering over the top of the
+     * child overlaid windows despite having a clip
+     * mask set :-( We've turned on GTK3's built-in
+     * double buffering to work around this until we
+     * find a better idea.
+     */
+#if GTK_CHECK_VERSION(3, 0, 0)
+    gtk_widget_set_double_buffered(widget, TRUE);
+#else
     gtk_widget_set_double_buffered(widget, FALSE);
+#endif
 
     priv = display->priv = VNC_DISPLAY_GET_PRIVATE(display);
     memset(priv, 0, sizeof(VncDisplayPrivate));
@@ -2119,6 +2544,7 @@ static void vnc_display_init(VncDisplay *display)
     priv->local_pointer = FALSE;
     priv->shared_flag = FALSE;
     priv->force_size = TRUE;
+    priv->smoothing = TRUE;
     priv->vncgrabseq = vnc_grab_sequence_new_from_string("Control_L+Alt_L");
     priv->vncactiveseq = g_new0(gboolean, priv->vncgrabseq->nkeysyms);
 
@@ -2199,15 +2625,41 @@ static void vnc_display_init(VncDisplay *display)
                      G_CALLBACK(on_initialized), display);
     g_signal_connect(G_OBJECT(priv->conn), "vnc-disconnected",
                      G_CALLBACK(on_disconnected), display);
+    g_signal_connect(G_OBJECT(priv->conn), "vnc-error",
+                     G_CALLBACK(on_error), display);
 
     priv->keycode_map = vnc_display_keymap_gdk2rfb_table(&priv->keycode_maplen);
 }
 
+
+/**
+ * vnc_display_set_credential:
+ * @obj: (transfer none): the VNC display widget
+ * @type: the authentication credential type
+ * @data: (transfer none): the value associated with the credential
+ *
+ * Sets the value of the authentication credential
+ * @type to the string @data.
+ *
+ * @type is one of the VncConnectionCredential enum vlaues
+ *
+ * Returns: TRUE if an error occurs, FALSE otherwise
+ */
 gboolean vnc_display_set_credential(VncDisplay *obj, int type, const gchar *data)
 {
     return !vnc_connection_set_credential(obj->priv->conn, type, data);
 }
 
+
+/**
+ * vnc_display_set_poiter_local:
+ * @obj: (transfer none): the VNC display widget
+ * @enable: TRUE to show a local cursor, FALSE otherwise
+ *
+ * If @enable is TRUE, then a local mouse cursor will be
+ * made visible. If @enable is FALSE, the local mouse
+ * cursor will be hidden.
+ */
 void vnc_display_set_pointer_local(VncDisplay *obj, gboolean enable)
 {
     if (obj->priv->null_cursor) {
@@ -2219,6 +2671,15 @@ void vnc_display_set_pointer_local(VncDisplay *obj, gboolean enable)
     obj->priv->local_pointer = enable;
 }
 
+
+/**
+ * vnc_display_set_pointer_grab:
+ * @obj: (transfer none): the VNC display widget
+ * @enable: TRUE to enable automatic pointer grab, FALSE otherwise
+ *
+ * Set whether the widget will automatically grab the mouse
+ * pointer upon a button click
+ */
 void vnc_display_set_pointer_grab(VncDisplay *obj, gboolean enable)
 {
     VncDisplayPrivate *priv = obj->priv;
@@ -2231,13 +2692,15 @@ void vnc_display_set_pointer_grab(VncDisplay *obj, gboolean enable)
 
 /**
  * vnc_display_set_grab_keys:
- * @obj: (transfer none): the vnc display object
+ * @obj: (transfer none): the VNC display widget
  * @seq: (transfer none): the new grab sequence
  *
- * Set the key grab sequence
+ * Set the sequence of keys that must be pressed to
+ * activate keyborad and pointer grab
  */
 void vnc_display_set_grab_keys(VncDisplay *obj, VncGrabSequence *seq)
 {
+    obj->priv->vncgrabpending = FALSE;
     if (obj->priv->vncgrabseq) {
         vnc_grab_sequence_free(obj->priv->vncgrabseq);
         g_free(obj->priv->vncactiveseq);
@@ -2257,7 +2720,7 @@ void vnc_display_set_grab_keys(VncDisplay *obj, VncGrabSequence *seq)
 
 /**
  * vnc_display_get_grab_keys:
- * @obj: the vnc display object
+ * @obj: (transfer none): the VNC display widget
  *
  * Get the current grab key sequence
  *
@@ -2268,6 +2731,17 @@ VncGrabSequence *vnc_display_get_grab_keys(VncDisplay *obj)
     return obj->priv->vncgrabseq;
 }
 
+
+/**
+ * vnc_display_set_keyboard_grab:
+ * @obj: (transfer none): the VNC display widget
+ * @enable: TRUE to enable keyboard grab, FALSE otherwise
+ *
+ * Set whether the widget will grab the keyboard when it
+ * has focus. Grabbing the keyboard allows it to intercept
+ * special key sequences, ensuring they get sent to the
+ * remote desktop, rather than intepreted locally.
+ */
 void vnc_display_set_keyboard_grab(VncDisplay *obj, gboolean enable)
 {
     VncDisplayPrivate *priv = obj->priv;
@@ -2277,6 +2751,17 @@ void vnc_display_set_keyboard_grab(VncDisplay *obj, gboolean enable)
         do_keyboard_ungrab(obj, FALSE);
 }
 
+
+/**
+ * vnc_display_set_read_only:
+ * @obj: (transfer none): the VNC display widget
+ * @enable: TRUE to enable read-only mode, FALSE otherwise
+ *
+ * Set whether the widget is running in read-only mode. In
+ * read-only mode, keyboard and mouse events will not be
+ * sent to the remote desktop server. The widget will merely
+ * display activity from the server.
+ */
 void vnc_display_set_read_only(VncDisplay *obj, gboolean enable)
 {
     obj->priv->read_only = enable;
@@ -2308,7 +2793,7 @@ static void vnc_display_convert_data(GdkPixbuf *pixbuf,
 
 /**
  * vnc_display_get_pixbuf:
- * @obj: a #VncDisplay
+ * @obj: (transfer none): the VNC display widget
  *
  * Take a screenshot of the display.
  *
@@ -2346,6 +2831,16 @@ GdkPixbuf *vnc_display_get_pixbuf(VncDisplay *obj)
 }
 
 
+/**
+ * vnc_display_get_width:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Get the width of the remote desktop. This is only
+ * valid after the "vnc-initialized" signal has been
+ * emitted
+ *
+ * Returns: the remote desktop width
+ */
 int vnc_display_get_width(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), -1);
@@ -2353,6 +2848,17 @@ int vnc_display_get_width(VncDisplay *obj)
     return vnc_connection_get_width (obj->priv->conn);
 }
 
+
+/**
+ * vnc_display_get_height:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Get the height of the remote desktop. This is only
+ * valid after the "vnc-initialized" signal has been
+ * emitted
+ *
+ * Returns: the remote desktop height
+ */
 int vnc_display_get_height(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), -1);
@@ -2360,6 +2866,17 @@ int vnc_display_get_height(VncDisplay *obj)
     return vnc_connection_get_height (obj->priv->conn);
 }
 
+
+/**
+ * vnc_display_get_name:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Get the name of the remote desktop. This is only
+ * valid after the "vnc-initialized" signal has been
+ * emitted
+ *
+ * Returns: (transfer none): the remote desktop name
+ */
 const char * vnc_display_get_name(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), NULL);
@@ -2367,6 +2884,16 @@ const char * vnc_display_get_name(VncDisplay *obj)
     return vnc_connection_get_name (obj->priv->conn);
 }
 
+
+/**
+ * vnc_display_cut_text:
+ * @obj: (transfer none): the VNC display widget
+ * @text: (transfer none): the clipboard text
+ *
+ * Send a text string to the remote desktop clipboard. The
+ * encoding for @text is undefined, but it is recommended
+ * to use UTF-8.
+ */
 void vnc_display_client_cut_text(VncDisplay *obj, const gchar *text)
 {
     g_return_if_fail (VNC_IS_DISPLAY (obj));
@@ -2375,18 +2902,53 @@ void vnc_display_client_cut_text(VncDisplay *obj, const gchar *text)
         vnc_connection_client_cut_text(obj->priv->conn, text, strlen (text));
 }
 
+
+/**
+ * vnc_display_set_lossy_encoding:
+ * @obj: (transfer none): the VNC display widget
+ * @enable: TRUE to permit lossy encodings, FALSE otherwise
+ *
+ * Set whether the client is willing to accept lossy
+ * framebuffer update encodings. Lossy encodings can
+ * improve performance by lowering network bandwidth
+ * requirements, with a cost that the display received
+ * by the client will not be pixel perfect
+ */
 void vnc_display_set_lossy_encoding(VncDisplay *obj, gboolean enable)
 {
     g_return_if_fail (VNC_IS_DISPLAY (obj));
     obj->priv->allow_lossy = enable;
 }
 
+
+/**
+ * vnc_display_set_shared_flag:
+ * @obj: (transfer none): the VNC display widget
+ * @shared: the new sharing state
+ *
+ * Set the shared state for the connection. A TRUE value
+ * allow allow this client to co-exist with other existing
+ * clients. A FALSE value will cause other clients to be
+ * dropped
+ */
 void vnc_display_set_shared_flag(VncDisplay *obj, gboolean shared)
 {
     g_return_if_fail (VNC_IS_DISPLAY (obj));
     obj->priv->shared_flag = shared;
 }
 
+
+/**
+ * vnc_display_set_scaling:
+ * @obj: (transfer none): the VNC display widget
+ * @enable: TRUE to allow scaling the desktop to fit, FALSE otherwise
+ *
+ * Set whether the remote desktop contents is automatically
+ * scaled to fit the available widget size, or whether it
+ * will be rendered at 1:1 size
+ *
+ * Returns: TRUE always
+ */
 gboolean vnc_display_set_scaling(VncDisplay *obj,
                                  gboolean enable)
 {
@@ -2395,20 +2957,74 @@ gboolean vnc_display_set_scaling(VncDisplay *obj,
     obj->priv->allow_scaling = enable;
 
     if (obj->priv->fb != NULL) {
-        gdk_drawable_get_size(gtk_widget_get_window(GTK_WIDGET(obj)), &ww, &wh);
-        gtk_widget_queue_draw_area(GTK_WIDGET(obj), 0, 0, ww, wh);
+        GdkWindow *window = gtk_widget_get_window(GTK_WIDGET(obj));
+
+        if (window != NULL) {
+            gdk_drawable_get_size(gtk_widget_get_window(GTK_WIDGET(obj)),
+                                  &ww, &wh);
+            gtk_widget_queue_draw_area(GTK_WIDGET(obj), 0, 0, ww, wh);
+        }
     }
 
     return TRUE;
 }
 
 
+/**
+ * vnc_display_force_size:
+ * @obj: (transfer none): the VNC display widget
+ * @enabled: TRUE to force the widget size, FALSE otherwise
+ *
+ * Set whether the widget size will be forced to match the
+ * remote desktop size. If the widget size does not match
+ * the remote desktop size, and scaling is disabled, some
+ * of the remote desktop may be hidden, or black borders
+ * may be drawn.
+ */
 void vnc_display_set_force_size(VncDisplay *obj, gboolean enabled)
 {
     g_return_if_fail (VNC_IS_DISPLAY (obj));
     obj->priv->force_size = enabled;
 }
 
+
+/**
+ * vnc_display_smoothing:
+ * @obj: (transfer none): the VNC display widget
+ * @enabled: TRUE to enable smooth scaling, FALSE otherwise
+ *
+ * Set whether pixels are smoothly interpolated when scaling,
+ * to avoid aliasing.
+ */
+void vnc_display_set_smoothing(VncDisplay *obj, gboolean enabled)
+{
+    int ww, wh;
+
+    g_return_if_fail (VNC_IS_DISPLAY (obj));
+    obj->priv->smoothing = enabled;
+
+    if (obj->priv->fb != NULL) {
+        GdkWindow *window = gtk_widget_get_window(GTK_WIDGET(obj));
+
+        if (window != NULL) {
+            gdk_drawable_get_size(gtk_widget_get_window(GTK_WIDGET(obj)),
+                                  &ww, &wh);
+            gtk_widget_queue_draw_area(GTK_WIDGET(obj), 0, 0, ww, wh);
+        }
+    }
+}
+
+
+/**
+ * vnc_display_set_depth:
+ * @obj: (transfer none): the VNC display widget
+ * @depth: the desired colour depth
+ *
+ * Set the desired colour depth. Higher quality colour
+ * depths will require greater network bandwidth. The
+ * colour depth must be set prior to connecting to the
+ * remote server
+ */
 void vnc_display_set_depth(VncDisplay *obj, VncDisplayDepthColor depth)
 {
     g_return_if_fail (VNC_IS_DISPLAY (obj));
@@ -2423,6 +3039,15 @@ void vnc_display_set_depth(VncDisplay *obj, VncDisplayDepthColor depth)
     obj->priv->depth = depth;
 }
 
+
+/**
+ * vnc_display_get_depth:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Get the desired colour depth
+ *
+ * Returns: the color depth
+ */
 VncDisplayDepthColor vnc_display_get_depth(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), 0);
@@ -2430,6 +3055,16 @@ VncDisplayDepthColor vnc_display_get_depth(VncDisplay *obj)
     return obj->priv->depth;
 }
 
+
+/**
+ * vnc_display_get_force_size:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Determine whether the widget size is being forced
+ * to match the desktop size
+ *
+ * Returns: TRUE if force size is enabled, FALSE otherwise
+ */
 gboolean vnc_display_get_force_size(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), FALSE);
@@ -2437,6 +3072,34 @@ gboolean vnc_display_get_force_size(VncDisplay *obj)
     return obj->priv->force_size;
 }
 
+
+/**
+ * vnc_display_get_smoothing:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Determine whether pixels are smoothly interpolated when
+ * scaling.
+ *
+ * Returns: TRUE if smoothing is enabled, FALSE otherwise
+ */
+gboolean vnc_display_get_smoothing(VncDisplay *obj)
+{
+    g_return_val_if_fail (VNC_IS_DISPLAY (obj), FALSE);
+
+    return obj->priv->smoothing;
+}
+
+
+/**
+ * vnc_display_get_scaling:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Determine whether the widget is permitted to
+ * scale the remote desktop to fit the current
+ * widget size.
+ *
+ * Returns: TRUE if scaling is permitted, FALSE otherwise
+ */
 gboolean vnc_display_get_scaling(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), FALSE);
@@ -2444,6 +3107,16 @@ gboolean vnc_display_get_scaling(VncDisplay *obj)
     return obj->priv->allow_scaling;
 }
 
+
+/**
+ * vnc_display_get_lossy_encoding:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Determine whether lossy framebuffer update encodings
+ * are permitted
+ *
+ * Returns: TRUE if lossy encodings are permitted, FALSE otherwie
+ */
 gboolean vnc_display_get_lossy_encoding(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), FALSE);
@@ -2451,6 +3124,16 @@ gboolean vnc_display_get_lossy_encoding(VncDisplay *obj)
     return obj->priv->allow_lossy;
 }
 
+
+/**
+ * vnc_display_get_shared_flag:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Determine if other clients are permitted to
+ * share the VNC connection
+ *
+ * Returns: TRUE if sharing is permittted, FALSE otherwise
+ */
 gboolean vnc_display_get_shared_flag(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), FALSE);
@@ -2458,6 +3141,15 @@ gboolean vnc_display_get_shared_flag(VncDisplay *obj)
     return obj->priv->shared_flag;
 }
 
+
+/**
+ * vnc_display_get_pointer_local:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Determine if a local pointer will be shown
+ *
+ * Returns: TRUE if a local pointer is shown, FALSE otherwise
+ */
 gboolean vnc_display_get_pointer_local(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), FALSE);
@@ -2465,6 +3157,16 @@ gboolean vnc_display_get_pointer_local(VncDisplay *obj)
     return obj->priv->local_pointer;
 }
 
+
+/**
+ * vnc_display_get_pointer_grab:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Determine if the mouse pointer will be grabbed
+ * on first click
+ *
+ * Returns: TRUE if the pointer will be grabbed, FALSE otherwise
+ */
 gboolean vnc_display_get_pointer_grab(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), FALSE);
@@ -2472,6 +3174,16 @@ gboolean vnc_display_get_pointer_grab(VncDisplay *obj)
     return obj->priv->grab_pointer;
 }
 
+
+/**
+ * vnc_display_get_keyboard_grab:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Determine if the keyboard will be grabbed when the
+ * widget has input focus.
+ *
+ * Returns: TRUE if the keyboard will be grabbed, FALSE otherwise
+ */
 gboolean vnc_display_get_keyboard_grab(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), FALSE);
@@ -2479,6 +3191,16 @@ gboolean vnc_display_get_keyboard_grab(VncDisplay *obj)
     return obj->priv->grab_keyboard;
 }
 
+
+/**
+ * vnc_display_get_read_only:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Determine if the widget will operate in read-only
+ * mode, denying keyboard/mouse inputs
+ *
+ * Returns: TRUE if in read-only mode, FALSE otherwise
+ */
 gboolean vnc_display_get_read_only(VncDisplay *obj)
 {
     g_return_val_if_fail (VNC_IS_DISPLAY (obj), FALSE);
@@ -2486,11 +3208,31 @@ gboolean vnc_display_get_read_only(VncDisplay *obj)
     return obj->priv->read_only;
 }
 
+
+/**
+ * vnc_display_is_pointer_absolute:
+ * @obj: (transfer none): the VNC display widget
+ *
+ * Determine if the pointer is operating in absolute
+ * mode. This is only valid after the "vnc-initialized"
+ * signal has been emitted
+ *
+ * Returns: TRUE if in absolute mode, FALSE for relative mode
+ */
 gboolean vnc_display_is_pointer_absolute(VncDisplay *obj)
 {
     return obj->priv->absolute;
 }
 
+
+/**
+ * vnc_display_get_option_group:
+ *
+ * Get a command line option group containing VNC specific
+ * options.
+ *
+ * Returns: (transfer full): the option group
+ */
 GOptionGroup *
 vnc_display_get_option_group (void)
 {
@@ -2504,12 +3246,26 @@ vnc_display_get_option_group (void)
     return group;
 }
 
+
+/**
+ * vnc_display_get_option_entries:
+ *
+ * Get the array of command line option entries containing
+ * VNC specific otions
+ *
+ * Returns: (array zero-terminated=1): the option entries
+ */
 const GOptionEntry *
 vnc_display_get_option_entries (void)
 {
     return gtk_vnc_args;
 }
 
+
+/**
+ * vnc_display_:
+ * @obj: (transfer none): the VNC display widget
+ */
 gboolean
 vnc_display_request_update(VncDisplay *obj)
 {

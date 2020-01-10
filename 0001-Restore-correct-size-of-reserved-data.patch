@@ -1,0 +1,46 @@
+From 9fe889dbd9e97ee947f13da3c86891940a1a1406 Mon Sep 17 00:00:00 2001
+From: "Daniel P. Berrange" <berrange@redhat.com>
+Date: Thu, 6 Apr 2017 17:12:24 +0100
+Subject: [PATCH] Restore correct size of reserved data
+
+A previous commit
+
+  commit 7a9271620c894931cc22d6587d58e46c5996dac3
+  Author: Lei Li <lilei@linux.vnet.ibm.com>
+  Date:   Mon May 20 11:45:59 2013 +0100
+
+    Add support for LED state extension to gvnc
+
+removed 4 elements from the reserved data field, when adding
+one pointer. This is because it mistakenly thought the reserved
+elements were 1 byte in length, when they are in fact one pointer
+in size.
+
+The original change was technically an ABI incompatible change,
+as is this fix. In practice, however, GObject classes are never
+instantiated statically at compile time. Instead a call to
+g_type_register_static is made at runtime. So this change in the
+class size won't have a negative effect unless someone has
+subclassed the VncConnectionClass type. Even if subclassing, this
+should be harmless as we've merely increased the memory allocation
+by 3 words.
+
+Signed-off-by: Daniel P. Berrange <berrange@redhat.com>
+(cherry picked from commit 77bd7cd620a1f9d45f9d479b55a5cba807732b91)
+---
+ src/vncconnection.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/vncconnection.h b/src/vncconnection.h
+index 8c1fa28..3477d1b 100644
+--- a/src/vncconnection.h
++++ b/src/vncconnection.h
+@@ -85,7 +85,7 @@ struct _VncConnectionClass
+      * If adding fields to this struct, remove corresponding
+      * amount of padding to avoid changing overall struct size
+      */
+-    gpointer _vnc_reserved[VNC_PADDING_LARGE - 5];
++    gpointer _vnc_reserved[VNC_PADDING_LARGE - 2];
+ };
+ 
+ 

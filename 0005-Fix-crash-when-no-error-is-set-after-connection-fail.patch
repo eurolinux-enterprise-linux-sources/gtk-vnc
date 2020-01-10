@@ -1,0 +1,36 @@
+From 4b202fd478ccbdb504c9c2a52b5ef4ddcc50838f Mon Sep 17 00:00:00 2001
+From: "Daniel P. Berrange" <berrange@redhat.com>
+Date: Tue, 11 Apr 2017 10:47:56 +0100
+Subject: [PATCH] Fix crash when no error is set after connection failure
+
+Signed-off-by: Daniel P. Berrange <berrange@redhat.com>
+(cherry picked from commit a51e6a6973e9bdfcba0e52d3f9ee37686cd95db9)
+---
+ src/vncconnection.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/vncconnection.c b/src/vncconnection.c
+index 8cec1af..e5b43a0 100644
+--- a/src/vncconnection.c
++++ b/src/vncconnection.c
+@@ -5428,7 +5428,7 @@ static gboolean vnc_connection_open_addr_internal(VncConnection *conn)
+         return TRUE;
+     }
+     vnc_connection_set_error(conn, "Unable to connect: %s",
+-                             conn_error ? conn_error->message : "");
++                             conn_error ? conn_error->message : "Unknown problem");
+     g_clear_error(&conn_error);
+     return FALSE;
+ }
+@@ -5466,8 +5466,9 @@ static gboolean vnc_connection_open_host_internal(VncConnection *conn)
+     }
+     g_object_unref(enumerator);
+     if (!sock) {
+-        vnc_connection_set_error(conn, "Unable to connect: %s",
+-                                 conn_error->message);
++        vnc_connection_set_error(conn, "Unable to connect to %s:%s: %s",
++                                 priv->host, priv->port,
++                                 conn_error ? conn_error->message : "Unknown problem");
+     }
+     g_clear_error(&conn_error);
+     if (sock) {

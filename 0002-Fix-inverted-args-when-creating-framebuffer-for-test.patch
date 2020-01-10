@@ -1,0 +1,29 @@
+From 871f698cfdd4a7a43e3a155e2b31a13bf54a3cc5 Mon Sep 17 00:00:00 2001
+From: "Daniel P. Berrange" <berrange@redhat.com>
+Date: Thu, 6 Apr 2017 17:18:33 +0100
+Subject: [PATCH] Fix inverted args when creating framebuffer for test suite
+
+The local & remote format args were inverted in the test
+suite. This is currently harmless since we are not trying
+to validate the rendered framebuffer content.
+
+Signed-off-by: Daniel P. Berrange <berrange@redhat.com>
+(cherry picked from commit 1f508111add33f0e4ceb4425132777d781974730)
+---
+ src/vncconnectiontest.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/src/vncconnectiontest.c b/src/vncconnectiontest.c
+index 6a5e49c..7caaa6e 100644
+--- a/src/vncconnectiontest.c
++++ b/src/vncconnectiontest.c
+@@ -187,8 +187,7 @@ static void test_helper_desktop_resize(VncConnection *conn,
+     test->pixels = g_new0(guint8, width * height * 4);
+ 
+     fb = vnc_base_framebuffer_new(test->pixels, width, height, width * 4,
+-                                  remoteFormat,
+-                                  &localFormat);
++                                  &localFormat, remoteFormat);
+ 
+     vnc_connection_set_framebuffer(conn, VNC_FRAMEBUFFER(fb));
+ 

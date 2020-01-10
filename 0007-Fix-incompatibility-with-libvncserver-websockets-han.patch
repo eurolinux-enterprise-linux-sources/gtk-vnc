@@ -1,0 +1,241 @@
+From 7079fa855bfbaff0d14122eac27e96a6a6637a17 Mon Sep 17 00:00:00 2001
+From: "Daniel P. Berrange" <berrange@redhat.com>
+Date: Tue, 11 Apr 2017 11:41:03 +0100
+Subject: [PATCH] Fix incompatibility with libvncserver websockets handling
+
+The previous commit:
+
+  commit 7f4f2fe8da72ed9fef5dd4319e19feb2b4f3d62e
+  Author: Daniel P. Berrange <berrange@redhat.com>
+  Date:   Thu Jan 26 09:31:40 2017 +0000
+
+    Add workaround to avoid hangs when connecting to SPICE
+
+changed the code so that it would send the bytes "RFB " to the
+server before we received its own greeting. This works fine for
+VNC servers which follow the RFB protocol spec exclusively. The
+libvncserver code though tries to implement websockets tunnelling
+support on the same port as the normal RFB service. The way it
+does this is by waiting 100ms after the client connects to see
+if the client sends any data. If the client sends data, then it
+tries to interpret this as an HTTP GET request to initiate the
+websockets connection. This breaks when it sees our "RFB " bytes
+being sent. Ideally the libvncserver would have just run a normal
+RFB connection in this case, but that's not what happens, and
+given the libvncserver code is in the wild we need a workaround.
+
+So instead of immediately sending the 'RFB ' bytes to the VNC
+server, we introduce a 2 second wait. ie, we'll wait for the
+normal VNC server greeting and if it doesn't arrive after 2 seconds,
+we'll send our 'RFB ' bytes proactively, and continue waiting. If we
+are on a real VNC server, we'll get our connection initialized
+eventually. If connecting to a SPICE server by mistake, we'll get a
+clean disconnect, and we'll avoid upsetting libvncserver, because its
+100ms wait for HTTP GET will have long since finished.
+
+Signed-off-by: Daniel P. Berrange <berrange@redhat.com>
+(cherry picked from commit f5623cbc63bb0a835bc662d451cc5128d683bd5d)
+---
+ src/vncconnection.c | 134 +++++++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 90 insertions(+), 44 deletions(-)
+
+diff --git a/src/vncconnection.c b/src/vncconnection.c
+index 2b2bdbb..1ddf38d 100644
+--- a/src/vncconnection.c
++++ b/src/vncconnection.c
+@@ -347,6 +347,23 @@ static GIOCondition g_io_wait(GSocket *sock, GIOCondition cond)
+ }
+ 
+ 
++static void g_io_wakeup(struct wait_queue *wait)
++{
++    if (wait->waiting)
++        coroutine_yieldto(wait->context, NULL);
++}
++
++
++static gboolean vnc_connection_timeout(gpointer data)
++{
++    struct wait_queue *wait = data;
++
++    g_io_wakeup(wait);
++
++    return FALSE;
++}
++
++
+ static GIOCondition g_io_wait_interruptable(struct wait_queue *wait,
+                                             GSocket *sock,
+                                             GIOCondition cond)
+@@ -373,13 +390,6 @@ static GIOCondition g_io_wait_interruptable(struct wait_queue *wait,
+         return *ret;
+ }
+ 
+-static void g_io_wakeup(struct wait_queue *wait)
+-{
+-    if (wait->waiting)
+-        coroutine_yieldto(wait->context, NULL);
+-}
+-
+-
+ /*
+  * Call immediately before the main loop does an iteration. Returns
+  * true if the condition we're checking is ready for dispatch
+@@ -921,8 +931,13 @@ static int vnc_connection_read(VncConnection *conn, void *data, size_t len)
+         } else if (priv->read_offset == priv->read_size) {
+             int ret = vnc_connection_read_buf(conn);
+ 
+-            if (ret < 0)
+-                return ret;
++            if (ret < 0) {
++                if (ret == -EAGAIN) {
++                    return offset == 0 ? -EAGAIN : offset;
++                } else {
++                    return ret;
++                }
++            }
+             priv->read_offset = 0;
+             priv->read_size = ret;
+         }
+@@ -935,7 +950,7 @@ static int vnc_connection_read(VncConnection *conn, void *data, size_t len)
+         offset += tmp;
+     }
+ 
+-    return 0;
++    return len;
+ }
+ 
+ /*
+@@ -5239,34 +5254,66 @@ static gboolean vnc_connection_after_version (VncConnection *conn, int major, in
+ static gboolean vnc_connection_initialize(VncConnection *conn)
+ {
+     VncConnectionPrivate *priv = conn->priv;
+-    int ret, i;
++    int ret, i, want;
+     char version[13];
+     guint32 n_name;
++    gboolean partialGreeting = FALSE;
++    guint timeout;
+ 
+     priv->absPointer = TRUE;
+ 
+-    /* We should technically read the server greeting first.
+-     * If the user mistakenly connects to a SPICE server
+-     * though, we'll never see the greeting, because with
+-     * SPICE the client starts first.
+-     *
+-     * By sending these 4 bytes first, if the user has
+-     * accidentally connected to a SPICE server, it will
+-     * notice this garbage and close the connection, avoiding
+-     * us waiting forever for a VNC greeting that'll never
+-     * come.
+-     *
+-     * This is harmless for real VNC servers, since the
+-     * early send will just be queued until they've sent
+-     * their greeting
+-     */
+-    vnc_connection_write(conn, "RFB ", 4);
+-    vnc_connection_flush(conn);
++    timeout = g_timeout_add_seconds(2, vnc_connection_timeout, &priv->wait);
++    want = 12;
++    while (want > 0) {
++        priv->wait_interruptable = 1;
++        ret = vnc_connection_read(conn, version + (12 - want), want);
++        priv->wait_interruptable = 0;
++        if (vnc_connection_has_error(conn)) {
++            VNC_DEBUG("Error while reading server version");
++            goto fail;
++        }
++        if (ret >= 0) {
++            want -= ret;
++            if (ret != 12)  {
++                timeout = 0;
++            }
++        } else {
++            if (ret == -EAGAIN) {
++                /*
++                 * We didn't see any RFB greeting before our
++                 * timeout. We might have mistakenly connected
++                 * to a SPICE server, in which case we might
++                 * wait forever, since SPICE expects the client
++                 * to send first.
++                 *
++                 * We'll proactively send the 'RFB ' bytes to the
++                 * sever. If we've just got a slow VNC server, it'll
++                 * be harmless, but if we've got a SPICE server, this
++                 * should trigger it to close the connection, avoiding
++                 * us waiting foever.
++                 *
++                 * NB, while we could just send the "RFB " bytes
++                 * immediately, the libvncserver code does something
++                 * really crazy. When it sees a client connection, it
++                 * waits 100ms for an HTTP GET request to indicate
++                 * use of websockets proxy. If it sees the RFB bytes
++                 * it doesn't run a normal VNC connection, it just kills
++                 * the connection :-(
++                 */
++                VNC_DEBUG("No server greeting, sending partial client greeting");
++                vnc_connection_write(conn, "RFB ", 4);
++                vnc_connection_flush(conn);
++                partialGreeting = TRUE;
++                timeout = 0;
++            } else {
++                VNC_DEBUG("Unexpected read error during greeting");
++                goto fail;
++            }
++        }
++    }
+ 
+-    vnc_connection_read(conn, version, 12);
+-    if (vnc_connection_has_error(conn)) {
+-        VNC_DEBUG("Error while reading server version");
+-        goto fail;
++    if (timeout != 0) {
++        g_source_remove(timeout);
+     }
+ 
+     version[12] = 0;
+@@ -5291,8 +5338,16 @@ static gboolean vnc_connection_initialize(VncConnection *conn)
+         priv->minor = 8;
+     }
+ 
+-    snprintf(version, 13, "%03d.%03d\n", priv->major, priv->minor);
+-    vnc_connection_write(conn, version, 8);
++    if (partialGreeting) {
++        VNC_DEBUG("Sending rest of greeting");
++        snprintf(version, 13, "%03d.%03d\n", priv->major, priv->minor);
++        want = 8;
++    } else {
++        VNC_DEBUG("Sending full greeting");
++        snprintf(version, 13, "RFB %03d.%03d\n", priv->major, priv->minor);
++        want = 12;
++    }
++    vnc_connection_write(conn, version, want);
+     vnc_connection_flush(conn);
+     VNC_DEBUG("Using version: %d.%d", priv->major, priv->minor);
+ 
+@@ -5358,15 +5413,6 @@ static gboolean vnc_connection_open_fd_internal(VncConnection *conn)
+     return !vnc_connection_has_error(conn);
+ }
+ 
+-static gboolean connect_timeout(gpointer data)
+-{
+-    struct wait_queue *wait = data;
+-
+-    g_io_wakeup(wait);
+-
+-    return FALSE;
+-}
+-
+ static GSocket *vnc_connection_connect_socket(struct wait_queue *wait,
+                                               GSocketAddress *sockaddr,
+                                               GError **error)
+@@ -5379,7 +5425,7 @@ static GSocket *vnc_connection_connect_socket(struct wait_queue *wait,
+     if (!sock)
+         return NULL;
+ 
+-    guint timeout = g_timeout_add_seconds(10, connect_timeout, wait);
++    guint timeout = g_timeout_add_seconds(10, vnc_connection_timeout, wait);
+ 
+     g_socket_set_blocking(sock, FALSE);
+     if (!g_socket_connect(sock, sockaddr, NULL, error)) {
