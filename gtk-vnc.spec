@@ -20,7 +20,7 @@
 Summary: A GTK2 widget for VNC clients
 Name: gtk-vnc
 Version: 0.5.2
-Release: 5%{?dist}%{?extra_release}
+Release: 7%{?dist}%{?extra_release}
 License: LGPLv2+
 Group: Development/Libraries
 Source: http://ftp.gnome.org/pub/GNOME/sources/%{name}/0.5/%{name}-%{version}.tar.xz
@@ -333,6 +333,12 @@ rm -fr %{buildroot}
 %endif
 
 %changelog
+* Fri Jan 24 2014 Daniel Mach <dmach@redhat.com> - 0.5.2-7
+- Mass rebuild 2014-01-24
+
+* Fri Dec 27 2013 Daniel Mach <dmach@redhat.com> - 0.5.2-6
+- Mass rebuild 2013-12-27
+
 * Wed Oct  9 2013 Daniel P. Berrange <berrange@redhat.com> - 0.5.2-5
 - Fix missing/incorrect deps in sub-RPMs
 
