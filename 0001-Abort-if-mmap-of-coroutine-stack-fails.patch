@@ -1,0 +1,42 @@
+From 18d452c1b5229198aa04d4a04f7acce9bc662c8f Mon Sep 17 00:00:00 2001
+From: "Daniel P. Berrange" <berrange@redhat.com>
+Date: Fri, 13 Sep 2013 12:05:55 +0100
+Subject: [PATCH] Abort if mmap of coroutine stack fails
+
+For
+
+  https://bugzilla.redhat.com/show_bug.cgi?id=1007837
+
+If we fail to mmap the stack, abort the processs rather
+than returning an error. This is standard practice in
+glib apps, and the caller was not checking the
+coroutine_init() return code leading to memory corruption.
+
+Signed-off-by: Daniel P. Berrange <berrange@redhat.com>
+(cherry picked from commit b3963416e22382a1fa0ef2d4196f421ef6aee56d)
+---
+ src/coroutine_ucontext.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/coroutine_ucontext.c b/src/coroutine_ucontext.c
+index a97e2b1..848016e 100644
+--- a/src/coroutine_ucontext.c
++++ b/src/coroutine_ucontext.c
+@@ -20,6 +20,7 @@
+ 
+ #include <config.h>
+ 
++#include <glib.h>
+ #include <sys/types.h>
+ #include <sys/mman.h>
+ #include <stdio.h>
+@@ -63,7 +64,8 @@ int coroutine_init(struct coroutine *co)
+                         MAP_PRIVATE | MAP_ANONYMOUS,
+                         -1, 0);
+     if (co->cc.stack == MAP_FAILED)
+-        return -1;
++        g_error("Failed to allocate %u bytes for coroutine stack",
++                (unsigned)co->stack_size);
+     co->cc.entry = coroutine_trampoline;
+     co->cc.release = _coroutine_release;
+     co->exited = 0;

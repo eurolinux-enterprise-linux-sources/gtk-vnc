@@ -1,0 +1,31 @@
+From 63c2a334ca2d1c13f8f6d424ff5ebdc2c166ce63 Mon Sep 17 00:00:00 2001
+From: "Daniel P. Berrange" <berrange@redhat.com>
+Date: Fri, 13 Sep 2013 12:06:57 +0100
+Subject: [PATCH] Free coroutine stack when releasing coroutine
+
+For
+
+  https://bugzilla.redhat.com/show_bug.cgi?id=1007837
+
+The coroutine_init function mmap's a stack for the
+ucontext coroutine, but nothing ever munmaps it.
+
+Signed-off-by: Daniel P. Berrange <berrange@redhat.com>
+(cherry picked from commit 49fbd957cb686ff3f9c31923ff17a9529edd9c13)
+---
+ src/coroutine_ucontext.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/coroutine_ucontext.c b/src/coroutine_ucontext.c
+index 848016e..8fe650e 100644
+--- a/src/coroutine_ucontext.c
++++ b/src/coroutine_ucontext.c
+@@ -42,6 +42,8 @@ static int _coroutine_release(struct continuation *cc)
+             return ret;
+     }
+ 
++    munmap(co->cc.stack, co->cc.stack_size);
++
+     co->caller = NULL;
+ 
+     return 0;
