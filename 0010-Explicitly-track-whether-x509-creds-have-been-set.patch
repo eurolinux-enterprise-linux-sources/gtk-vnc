@@ -1,0 +1,87 @@
+From 04a3fe9e8122166eb8f257396fd07314182d2fc2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20P=2E=20Berrang=C3=A9?= <berrange@redhat.com>
+Date: Wed, 31 Jan 2018 11:27:10 +0000
+Subject: [PATCH] Explicitly track whether x509 creds have been set
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If we want to use the system trust DB, we can't rely on cred_x509_cacert
+field being non-NULL. We must explicitly record whether the client app
+has set the x509 credentials. We allow cacert to be missing if we are
+built against a new enough GNUTLS.
+
+Signed-off-by: Daniel P. Berrangé <berrange@redhat.com>
+(cherry picked from commit abc27748c6ca309ec3c39fb6c84426a459f56c74)
+---
+ src/vncconnection.c | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/src/vncconnection.c b/src/vncconnection.c
+index 35966c9..7fcbe89 100644
+--- a/src/vncconnection.c
++++ b/src/vncconnection.c
+@@ -217,6 +217,7 @@ struct _VncConnectionPrivate
+     char *cred_x509_cacrl;
+     char *cred_x509_cert;
+     char *cred_x509_key;
++    gboolean set_cred_x509;
+     gboolean want_cred_username;
+     gboolean want_cred_password;
+     gboolean want_cred_x509;
+@@ -3528,7 +3529,7 @@ static gboolean vnc_connection_has_credentials(gpointer data)
+         return FALSE;
+     if (priv->want_cred_password && !priv->cred_password)
+         return FALSE;
+-    if (priv->want_cred_x509 && !priv->cred_x509_cacert)
++    if (priv->want_cred_x509 && !priv->set_cred_x509)
+         return FALSE;
+     return TRUE;
+ }
+@@ -5122,6 +5123,7 @@ static void vnc_connection_close(VncConnection *conn)
+         priv->cred_password = NULL;
+     }
+ 
++    priv->set_cred_x509 = FALSE;
+     if (priv->cred_x509_cacert) {
+         g_free(priv->cred_x509_cacert);
+         priv->cred_x509_cacert = NULL;
+@@ -5838,6 +5840,7 @@ static gboolean vnc_connection_set_credential_x509(VncConnection *conn,
+ {
+     VncConnectionPrivate *priv = conn->priv;
+     char *sysdir = g_strdup_printf("%s/pki", SYSCONFDIR);
++    int ret;
+ #ifndef WIN32
+     struct passwd *pw;
+ 
+@@ -5852,9 +5855,19 @@ static gboolean vnc_connection_set_credential_x509(VncConnection *conn,
+     for (int i = 0 ; i < sizeof(dirs)/sizeof(dirs[0]) ; i++)
+         VNC_DEBUG("Searching for certs in %s", dirs[i]);
+ 
+-    if (vnc_connection_best_path(&priv->cred_x509_cacert, "CA", "cacert.pem",
+-                                 dirs, sizeof(dirs)/sizeof(dirs[0])) < 0)
++    ret = vnc_connection_best_path(&priv->cred_x509_cacert, "CA", "cacert.pem",
++                                   dirs, sizeof(dirs)/sizeof(dirs[0]));
++    /* With modern GNUTLS we can just allow the global GNUTLS trust database
++     * to be used to validate CA certificates if no specific cert is set
++     */
++    if (ret < 0) {
++#if GNUTLS_VERSION_NUMBER < 0x030000
++        VNC_DEBUG("No CA certificate provided and no global fallback");
+         return FALSE;
++#else
++        VNC_DEBUG("No CA certificate provided, using GNUTLS global trust");
++#endif
++    }
+ 
+     /* Don't mind failures of CRL */
+     vnc_connection_best_path(&priv->cred_x509_cacrl, "CA", "cacrl.pem",
+@@ -5867,6 +5880,8 @@ static gboolean vnc_connection_set_credential_x509(VncConnection *conn,
+     vnc_connection_best_path(&priv->cred_x509_cert, name, "clientcert.pem",
+                              dirs, sizeof(dirs)/sizeof(dirs[0]));
+ 
++    priv->set_cred_x509 = TRUE;
++
+     return TRUE;
+ }
+ 

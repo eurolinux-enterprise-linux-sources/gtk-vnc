@@ -31,7 +31,7 @@
 Summary: A GTK2 widget for VNC clients
 Name: gtk-vnc
 Version: 0.7.0
-Release: 2%{?dist}%{?extra_release}
+Release: 3%{?dist}%{?extra_release}
 License: LGPLv2+
 Group: Development/Libraries
 Source: http://ftp.gnome.org/pub/GNOME/sources/%{name}/0.5/%{name}-%{version}.tar.xz
@@ -42,6 +42,9 @@ Patch4: 0004-Fix-crash-when-opening-connection-from-a-GSocketAddr.patch
 Patch5: 0005-Fix-crash-when-no-error-is-set-after-connection-fail.patch
 Patch6: 0006-Report-a-proper-error-message-if-hitting-connection-.patch
 Patch7: 0007-Fix-incompatibility-with-libvncserver-websockets-han.patch
+Patch8: 0008-Don-t-short-circuit-request-for-TLS-credentials.patch
+Patch9: 0009-Add-debug-logs-wrt-credential-gathering.patch
+Patch10: 0010-Explicitly-track-whether-x509-creds-have-been-set.patch
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 URL: https://wiki.gnome.org/Projects/gtk-vnc
 Requires: gvnc = %{version}-%{release}
@@ -177,6 +180,9 @@ cd gtk-vnc-%{version}
 %patch5 -p1
 %patch6 -p1
 %patch7 -p1
+%patch8 -p1
+%patch9 -p1
+%patch10 -p1
 cd ..
 %if %{with_gtk3}
 cp -a gtk-vnc-%{version} gtk-vnc2-%{version}
@@ -351,6 +357,9 @@ rm -fr %{buildroot}
 %endif
 
 %changelog
+* Thu Feb  1 2018 Daniel P. Berrange <berrange@redhat.com> - 0.7.0-3
+- Fix TLS credentials request (rhbz #1539148)
+
 * Wed Apr 12 2017 Daniel P. Berrange <berrange@redhat.com> - 0.7.0-2
 - Fix reserved data size (rhbz #1416783)
 - Fix inverted args in tests (rhbz #1416783)	  
